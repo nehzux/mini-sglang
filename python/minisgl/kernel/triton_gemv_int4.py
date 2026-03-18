@@ -77,7 +77,9 @@ def triton_gemv_int4(
     y = torch.empty(N, device=x.device, dtype=x.dtype)
     num_groups = M // group_size
 
-    BLOCK_N = 2
+    # BLOCK_N=8, num_warps=2 for large N (lm_head); BLOCK_N=2, num_warps=4 for small N
+    BLOCK_N = 8 if N >= 4096 else 2
+    num_warps = 2 if N >= 4096 else 4
     BLOCK_M = min(1024, M)
     assert BLOCK_M % group_size == 0
     assert BLOCK_M % 2 == 0
@@ -91,6 +93,7 @@ def triton_gemv_int4(
         GROUP_SIZE=group_size,
         BLOCK_N=BLOCK_N,
         BLOCK_M=BLOCK_M,
+        num_warps=num_warps,
     )
 
     if len(orig_shape) > 1:

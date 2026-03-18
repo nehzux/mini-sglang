@@ -385,6 +385,29 @@ class FlashInferBackend(BaseAttnBackend):
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_fast(metadata)
 
+    def prepare_for_replay_multistep(
+        self, batch: Batch, step_out_locs: torch.Tensor, num_steps: int
+    ) -> None:
+        """Set up split-K buffers for multi-step graph replay."""
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, FIMetadata) and not metadata.initialized
+        assert self._use_splitk and batch.padded_size == 1
+        metadata.initialized = True
+
+        seq_len = metadata.seq_lens_cpu[0].item()
+        self._splitk_page_indices[:seq_len].copy_(
+            metadata.indices[:seq_len], non_blocking=True
+        )
+        self._splitk_seq_len[0] = seq_len
+
+        # Pre-write page indices for steps 1..num_steps-1
+        # Step k's attention reads page_indices[0:seq_len+k], so page_indices[seq_len+k-1]
+        # must hold the physical page for that position = step_out_locs[k]
+        if num_steps > 1:
+            self._splitk_page_indices[seq_len : seq_len + num_steps - 1].copy_(
+                step_out_locs[1:num_steps]
+            )
+
     def _initialize_metadata_fast(self, metadata: FIMetadata) -> None:
         """Like _initialize_metadata_once but skips the blocking synchronize."""
         if metadata.initialized:

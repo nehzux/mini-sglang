@@ -108,7 +108,7 @@ class Qwen3DecoderLayer(BaseOP):
             weight_scale=gate_up_s,
         )
 
-        # --- Down projection (INT8 handled by _fast_linear in Linear.forward) ---
+        # --- Down projection (INT4 handled by _fast_linear in Linear.forward) ---
         x = self.mlp.down_proj.forward(y)
         return x, self._res_buf_b
 
@@ -144,12 +144,31 @@ class Qwen3ForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
+        self._lm_head_res_buf: torch.Tensor | None = None
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        logits = self.lm_head.forward(output)
-        return logits
+        input_ids = get_global_ctx().batch.input_ids
+        x = self.model.embed_tokens.forward(input_ids)
+        residual: torch.Tensor | None = None
+        for layer in self.model.layers.op_list:
+            x, residual = layer.forward(x, residual)
+
+        # Fuse final norm + INT4 lm_head GEMV for bs=1 decode (saves 1 kernel)
+        w_int4 = getattr(self.lm_head, 'weight_int4', None)
+        if x.shape[0] == 1 and w_int4 is not None and residual is not None:
+            from minisgl.kernel.fused_norm_gemv_int4 import fused_add_rmsnorm_gemv_int4
+            if self._lm_head_res_buf is None:
+                self._lm_head_res_buf = torch.empty_like(residual)
+            return fused_add_rmsnorm_gemv_int4(
+                x, residual, self.model.norm.weight,
+                w_int4, self.lm_head.weight_scale_int4,
+                self.model.norm.eps,
+                residual_out=self._lm_head_res_buf,
+            )
+
+        output = self.model.norm.forward(x, residual)[0]
+        return self.lm_head.forward(output)
 
 
 __all__ = ["Qwen3ForCausalLM"]
